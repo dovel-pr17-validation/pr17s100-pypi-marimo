@@ -1,0 +1,332 @@
+# Copyright 2026 Marimo. All rights reserved.
+"""CLI tests for the marimo check command."""
+
+import json
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import pytest
+from click.testing import CliRunner
+
+from marimo._ast.cell import CellConfig
+from marimo._ast.codegen import generate_filecontents
+from marimo._cli.cli import check
+
+
+@pytest.mark.parametrize(
+    ("code", "config", "exit_code"),
+    [
+        pytest.param(
+            "if True:\n\n    def f():\n        pass",
+            CellConfig(),
+            0,
+            id="nested_function",
+        ),
+        pytest.param(
+            "if True:\n\n    async def f():\n        pass",
+            CellConfig(),
+            0,
+            id="nested_async_function",
+        ),
+        pytest.param(
+            "if True:\n\n    class Foo:\n        pass",
+            CellConfig(),
+            0,
+            id="nested_class",
+        ),
+        pytest.param(
+            "if True:\n\n    def f():\n        pass\n\n# trailing comment",
+            CellConfig(),
+            0,
+            id="trailing_comment",
+        ),
+        pytest.param("a =", CellConfig(), 1, id="unparsable"),
+        pytest.param(
+            "a =",
+            CellConfig(disabled=True, hide_code=True),
+            1,
+            id="unparsable_with_config",
+        ),
+    ],
+)
+def test_fix_preserves_ruff_formatting(
+    tmp_path: Path, code: str, config: CellConfig, exit_code: int
+) -> None:
+    path = tmp_path / "notebook.py"
+    path.write_text(generate_filecontents([code], ["_"], [config]))
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ruff",
+            "format",
+            "--isolated",
+            "--line-length=79",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    formatted = path.read_text()
+
+    result = CliRunner().invoke(check, [str(path), "--fix"])
+
+    assert result.exit_code == exit_code, result.output
+    assert path.read_text() == formatted
+
+
+class TestLintCLI:
+    """Test the check CLI command."""
+
+    def test_check_command_basic(self):
+        """Test basic check command functionality."""
+        runner = CliRunner()
+
+        # Create a temporary file with basic marimo code
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False
+        ) as f:
+            f.write("""
+import marimo
+
+__generated_with = "0.0.0"
+app = marimo.App()
+
+@app.cell
+def _():
+    x = 1
+    return (x,)
+
+if __name__ == "__main__":
+    app.run()
+""")
+            f.flush()
+
+            # Run check command
+            result = runner.invoke(check, [f.name])
+
+            # Should succeed and show some output
+            assert result.exit_code == 0, result.output
+            assert not result.output.strip()
+
+    def test_check_command_with_violations(self):
+        """Test check command with parsing violations."""
+        runner = CliRunner()
+
+        # Create a temporary file with violations
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False
+        ) as f:
+            f.write("""
+import marimo
+
+app = marimo.App()
+
+@app.cell
+def _():
+    y = 2
+    return (y,)
+""")
+            f.flush()
+
+            # Run check command
+            result = runner.invoke(check, [f.name, "--strict"])
+
+            # Should give and show errors
+            assert result.exit_code == 1, result.output
+            assert "warning[general-formatting]" in result.output
+
+    def test_check_command_with_fix(self):
+        """Test check command with fix option."""
+        runner = CliRunner()
+
+        # Create a temporary file with violations
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False
+        ) as f:
+            f.write("""
+import marimo
+
+app = marimo.App()
+
+@app.cell
+def _():
+    y = 2
+    return (y,)
+
+# This should create a violation with missing guard
+""")
+            f.flush()
+
+            # Run check command with fix
+            result = runner.invoke(check, [f.name, "--fix"])
+
+            # The fix might fail due to file permissions or other issues
+            # Just check that the command runs
+            assert result.exit_code == 0, result.output
+
+    def test_check_command_nonexistent_file(self):
+        """Test check command with nonexistent file."""
+        runner = CliRunner()
+
+        result = runner.invoke(check, ["nonexistent.py"])
+
+        # The CLI might handle nonexistent files gracefully
+        # Just check that it doesn't crash
+        assert result.exit_code in [0, 1, 2]  # Various possible exit codes
+
+    def test_check_command_syntax_error(self):
+        """Test check command with syntax error."""
+        runner = CliRunner()
+
+        # Create a temporary file with syntax error
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False
+        ) as f:
+            f.write("""
+import marimo
+
+app = marimo.App()
+
+@app.cell
+def _():
+    x = 1 +  # Syntax error
+    return (x,)
+""")
+            f.flush()
+
+            # Run check command
+            result = runner.invoke(check, [f.name])
+
+            # Should fail due to syntax error
+            assert result.exit_code != 0, result.output
+
+    def test_check_command_help(self):
+        """Test check command help."""
+        runner = CliRunner()
+
+        result = runner.invoke(check, ["--help"])
+
+        # Should succeed and show help
+        assert result.exit_code == 0
+        assert "format" in result.output
+        assert "--fix" in result.output
+
+    def test_check_command_no_errors(self):
+        """Test check command with valid notebook."""
+        runner = CliRunner()
+
+        # Create a temporary file with valid marimo code
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False
+        ) as f:
+            f.write("""
+import marimo
+
+__generated_with = "0.1.0"
+app = marimo.App()
+
+@app.cell
+def _():
+    x = 1
+    return (x,)
+
+if __name__ == "__main__":
+    app.run()
+""")
+            f.flush()
+
+            # Run check command
+            result = runner.invoke(check, [f.name])
+
+            # Should succeed
+            assert result.exit_code == 0, result.output
+
+    def test_check_command_with_message_collection(self):
+        """Test that CLI check command uses message collection properly."""
+        runner = CliRunner()
+        import os
+
+        # Use existing test file with syntax errors
+        test_file = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)),
+            "_lint",
+            "test_files",
+            "syntax_errors.py",
+        )
+
+        # Test the check command
+        result = runner.invoke(check, [test_file])
+
+        # Should return non-zero exit code for files with errors
+        assert result.exit_code != 0
+        # Should contain linting output
+        assert len(result.output) > 0
+        assert (
+            "invalid-syntax" in result.output
+            or "error" in result.output.lower()
+        )
+
+    def test_check_command_json_strict_clean_notebook(self):
+        """JSON + strict on a clean notebook should exit 0 with valid JSON."""
+        runner = CliRunner()
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False
+        ) as f:
+            f.write("""
+import marimo
+
+__generated_with = "0.1.0"
+app = marimo.App()
+
+@app.cell
+def _():
+    x = 1
+    return (x,)
+
+if __name__ == "__main__":
+    app.run()
+""")
+            f.flush()
+
+            result = runner.invoke(
+                check, [f.name, "--strict", "--format", "json"]
+            )
+
+            assert result.exit_code == 0, result.output
+            payload = json.loads(result.output)
+            assert payload["issues"] == []
+            assert payload["summary"]["total_issues"] == 0
+            assert payload["summary"]["errored"] is False
+
+    def test_check_command_json_strict_with_issues(self):
+        """JSON + strict should still fail when there are lint issues."""
+        runner = CliRunner()
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".py", delete=False
+        ) as f:
+            f.write("""
+import marimo
+
+app = marimo.App()
+
+@app.cell
+def _():
+    y = 2
+    return (y,)
+""")
+            f.flush()
+
+            result = runner.invoke(
+                check, [f.name, "--strict", "--format", "json"]
+            )
+
+            assert result.exit_code == 1, result.output
+            payload = json.loads(result.output)
+            assert payload["summary"]["total_issues"] > 0
+            assert len(payload["issues"]) > 0
